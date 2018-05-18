@@ -1,6 +1,3 @@
-# -*- coding: utf-8 -*-
-#
-# awsdbrparser/parser.py
 #
 # Copyright 2015 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 #
@@ -68,77 +65,96 @@ def analytics(config, echo):
     es = Elasticsearch([{'host': config.es_host, 'port': config.es_port}], timeout=config.es_timeout, http_auth=awsauth,
                        connection_class=RequestsHttpConnection)
     csv_file = csv.DictReader(file_in, delimiter=config.csv_delimiter)
-    analytics_daytime = dict()
-    analytics_day_only = dict()
+    userteam = []
+
     for recno, json_row in enumerate(csv_file):
         # Pre-Process the row to append extra information
         json_row = utils.pre_process(json_row)
         if is_control_message(json_row, config):
             # Skip this line
             continue
-        elif json_row.get('ProductName') == 'Amazon Elastic Compute Cloud' and 'RunInstances' in json_row.get(
-                'Operation') and json_row.get('UsageItem'):
-            # Get the day time ('2016-03-01 01:00:00')
-            daytime = json_row.get('UsageStartDate')
-            # the day only '2016-03-01'
-            day = json_row.get('UsageStartDate').split(' ')[0]
-            # Add the day time to the dict
-            analytics_daytime.setdefault(daytime, {"Count": 0, "Cost": 0.00, "RI": 0, "Spot": 0, "Unblended": 0.00})
-            # Increment the count of total instances
-            analytics_daytime[daytime]["Count"] += 1
-            analytics_daytime[daytime]["Unblended"] += float(json_row.get('UnBlendedCost', 0.00))
-            analytics_daytime[daytime]["Cost"] += float(json_row.get('Cost', 0.00))
+        elif json_row.get('ProductName') == 'Amazon Elastic Compute Cloud' and 'RunInstances' in json_row.get('Operation') and json_row.get('UsageItem'):
+            tagteam = json_row.get('user')
+            if tagteam.get('team') not in userteam:
+                userteam.append(tagteam.get('team'))
+    for team in userteam:
+        analytics_daytime = dict()
+        analytics_day_only = dict()
+        file_in2 = open(config.input_filename, 'r')
+        csv_file2 = csv.DictReader(file_in2, delimiter=config.csv_delimiter)
+        for recno2, json_row2 in enumerate(csv_file2):
+            # Pre-Process the row to append extra information
+            json_row2 = utils.pre_process(json_row2)
+            if is_control_message(json_row2, config):
+                # Skip this line
+                continue
+            elif json_row2.get('ProductName') == 'Amazon Elastic Compute Cloud' and 'RunInstances' in json_row2.get(
+                    'Operation') and json_row2.get('UsageItem'):
+                tagteam2 = json_row2.get('user')
+                userteam2 = tagteam2.get('team')
+                if (tagteam2.get('team') == team):
+                    # Get the day time ('2016-03-01 01:00:00')
+                    daytime = json_row2.get('UsageStartDate')
+                    # the day only '2016-03-01'
+                    day = json_row2.get('UsageStartDate').split(' ')[0]
+                    # Add the day time to the dict
+                    analytics_daytime.setdefault(daytime, {"Count": 0, "Cost": 0.00, "RI": 0, "Spot": 0, "Unblended": 0.00})
+                    # Increment the count of total instances
+                    analytics_daytime[daytime]["Count"] += 1
+                    analytics_daytime[daytime]["Unblended"] += float(json_row2.get('UnBlendedCost', 0.00))
+                    analytics_daytime[daytime]["Cost"] += float(json_row2.get('Cost', 0.00))
+                    # Add the day only to the dict
+                    analytics_day_only.setdefault(day, {"Count": 0, "RI": 0, "Spot": 0, "Min": None, "Max": None})
+                    analytics_day_only[day]["Count"] += 1
+                    # Increment the count of RI or Spot if the instance is one or other
+                    if json_row2.get('UsageItem') == 'Reserved Instance':
+                        analytics_day_only[day]["RI"] += 1
+                        analytics_daytime[daytime]["RI"] += 1
+                    elif json_row2.get('UsageItem') == 'Spot Instance':
+                        analytics_day_only[day]["Spot"] += 1
+                        analytics_daytime[daytime]["Spot"] += 1
 
-            # Add the day only to the dict
-            analytics_day_only.setdefault(day, {"Count": 0, "RI": 0, "Spot": 0, "Min": None, "Max": None})
-            analytics_day_only[day]["Count"] += 1
-            # Increment the count of RI or Spot if the instance is one or other
-            if json_row.get('UsageItem') == 'Reserved Instance':
-                analytics_day_only[day]["RI"] += 1
-                analytics_daytime[daytime]["RI"] += 1
-            elif json_row.get('UsageItem') == 'Spot Instance':
-                analytics_day_only[day]["Spot"] += 1
-                analytics_daytime[daytime]["Spot"] += 1
+        # Some DBR files has Cost (Single Account) and some has (Un)BlendedCost (Consolidated Account)
+        # In this case we try to process both, but one will be zero and we need to check
+        # TODO: use a single variable and an flag to output Cost or Unblended
+        for k, v in analytics_daytime.items():
+            result_cost = 1.0 / (v.get('Cost') / v.get('Count')) if v.get('Cost') else 0.00
+            result_unblended = 1.0 / (v.get('Unblended') / v.get('Count')) if v.get('Unblended') else 0.0
+            response = es.index(index=index_name, doc_type='ec2_per_usd',
+                                body={'UsageStartDate': k,
+                                      'EPU_Cost': result_cost,
+                                      'EPU_UnBlended': result_unblended,
+                                      'user.team': team})
+            if not response.get('created'):
+                echo('[!] Unable to send document to ES!')
 
-    # Some DBR files has Cost (Single Account) and some has (Un)BlendedCost (Consolidated Account)
-    # In this case we try to process both, but one will be zero and we need to check
-    # TODO: use a single variable and an flag to output Cost or Unblended
-    for k, v in analytics_daytime.items():
-        result_cost = 1.0 / (v.get('Cost') / v.get('Count')) if v.get('Cost') else 0.00
-        result_unblended = 1.0 / (v.get('Unblended') / v.get('Count')) if v.get('Unblended') else 0.0
+        # Elasticity
+        #
+        # The calculation is 1 - min / max EC2 instances per day
+        # The number of EC2 instances has been calculated previously
+        #
+        for k, v in analytics_day_only.items():
+            ec2_min = min(value["Count"] - value["RI"] for key, value in analytics_daytime.items() if k in key)
+            ec2_max = max(value["Count"] - value["RI"] for key, value in analytics_daytime.items() if k in key)
+            if ec2_max:
+                elasticity = 1.0 - float(ec2_min) / float(ec2_max)
+            else:
+                elasticity = 1.0
 
-        response = es.index(index=index_name, doc_type='ec2_per_usd',
-                            body={'UsageStartDate': k,
-                                  'EPU_Cost': result_cost,
-                                  'EPU_UnBlended': result_unblended})
-        if not response.get('created'):
-            echo('[!] Unable to send document to ES!')
+            ri_coverage = float(analytics_day_only[k]["RI"]) / float(analytics_day_only[k]["Count"])
+            spot_coverage = float(analytics_day_only[k]["Spot"]) / float(analytics_day_only[k]["Count"])
+            response = es.index(index=index_name, doc_type='elasticity',
+                                body={'UsageStartDate': k + ' 12:00:00',
+                                      'Elasticity': elasticity,
+                                      'ReservedCoverage': ri_coverage,
+                                      'SpotCoverage': spot_coverage,
+                                      'user.team': team})
 
-    # Elasticity
-    #
-    # The calculation is 1 - min / max EC2 instances per day
-    # The number of EC2 instances has been calculated previously
-    #
-    for k, v in analytics_day_only.items():
-        ec2_min = min(value["Count"] - value["RI"] for key, value in analytics_daytime.items() if k in key)
-        ec2_max = max(value["Count"] - value["RI"] for key, value in analytics_daytime.items() if k in key)
-        if ec2_max:
-            elasticity = 1.0 - float(ec2_min) / float(ec2_max)
-        else:
-            elasticity = 1.0
-
-        ri_coverage = float(analytics_day_only[k]["RI"]) / float(analytics_day_only[k]["Count"])
-        spot_coverage = float(analytics_day_only[k]["Spot"]) / float(analytics_day_only[k]["Count"])
-        response = es.index(index=index_name, doc_type='elasticity',
-                            body={'UsageStartDate': k + ' 12:00:00',
-                                  'Elasticity': elasticity,
-                                  'ReservedCoverage': ri_coverage,
-                                  'SpotCoverage': spot_coverage})
-
-        if not response.get('created'):
-            echo('[!] Unable to send document to ES!')
-
+            if not response.get('created'):
+                echo('[!] Unable to send document to ES!')
+        file_in2.close()
     file_in.close()
+
     # Finished Processing
     return
 
